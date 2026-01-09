@@ -588,7 +588,6 @@ def google_find_match_fuzzy(svc, rec: EventRecord) -> Optional[str]:
 # Outlook helpers (COM)
 # ----------------------------
 def outlook_namespace():
-    pythoncom.CoInitialize()
     app = win32com.client.Dispatch("Outlook.Application")
     ns = app.GetNamespace("MAPI")
     return ns
@@ -617,6 +616,32 @@ def outlook_list_changed_items(ns, since: dt.datetime) -> List[Any]:
     except Exception:
         for it in restricted:
             out.append(it)
+    return out
+
+def outlook_list_deleted_entry_ids(ns, since: dt.datetime) -> Set[str]:
+    # 3 = olFolderDeletedItems
+    deleted_folder = ns.GetDefaultFolder(3)
+    items = deleted_folder.Items
+    items.IncludeRecurrences = True
+    items.Sort("[LastModificationTime]")
+
+    flt = f"[LastModificationTime] >= '{dt_to_outlook_filter(since)}'"
+    restricted = items.Restrict(flt)
+
+    out: Set[str] = set()
+    try:
+        for i in range(1, restricted.Count + 1):
+            it = restricted.Item(i)
+            if outlook_item_is_appointment(it):
+                entry_id = getattr(it, "EntryID", None)
+                if entry_id:
+                    out.add(entry_id)
+    except Exception:
+        for it in restricted:
+            if outlook_item_is_appointment(it):
+                entry_id = getattr(it, "EntryID", None)
+                if entry_id:
+                    out.add(entry_id)
     return out
 
 def outlook_item_is_appointment(item) -> bool:
@@ -854,6 +879,7 @@ def google_dedupe_window(svc):
 def sync_once() -> Tuple[bool, Optional[str]]:
     db_init()
 
+    pythoncom.CoInitialize()
     ns = outlook_namespace()
     gsvc = google_service()
 
@@ -874,6 +900,7 @@ def sync_once() -> Tuple[bool, Optional[str]]:
     try:
         # --- Outlook changes
         outlook_changed: List[EventRecord] = []
+        deleted_outlook_ids: Set[str] = set()
         try:
             for it in outlook_list_changed_items(ns, since):
                 try:
@@ -883,6 +910,7 @@ def sync_once() -> Tuple[bool, Optional[str]]:
                             outlook_changed.append(rec)
                 except Exception as e:
                     print(f"[outlook] bad item EntryID={getattr(it,'EntryID',None)} Subject={getattr(it,'Subject',None)} err={e}")
+            deleted_outlook_ids = outlook_list_deleted_entry_ids(ns, since)
         except Exception as e:
             print(f"[outlook] error reading changes: {e}")
 
@@ -942,6 +970,28 @@ def sync_once() -> Tuple[bool, Optional[str]]:
 
             except Exception as e:
                 print(f"[sync] Google->Outlook failed googleId={grec.uid} err={e}")
+
+        # --- Outlook deletions -> Google
+        if deleted_outlook_ids:
+            for outlook_id in deleted_outlook_ids:
+                mapped = map_get_by_outlook(outlook_id)
+                if not mapped:
+                    continue
+                google_id, _, _ = mapped
+                if not google_id:
+                    continue
+                try:
+                    print(f"[sync] Outlook deleted -> Google delete: {outlook_id} -> {google_id}")
+                    google_delete_event(gsvc, google_id)
+                except HttpError as e:
+                    print(f"[sync] Outlook delete -> Google delete failed EntryID={outlook_id} err={e}")
+                    if is_rate_limited(e):
+                        google_token_safe_to_advance = False
+                        raise
+                except Exception as e:
+                    print(f"[sync] Outlook delete -> Google delete failed EntryID={outlook_id} err={e}")
+                else:
+                    map_delete_by_outlook(outlook_id)
 
         # --- Outlook -> Google
         for orec in outlook_changed:
@@ -1019,6 +1069,7 @@ def sync_once() -> Tuple[bool, Optional[str]]:
 
     finally:
         kv_set("outlook_last_poll", sync_start.isoformat())
+        pythoncom.CoUninitialize()
 
 
 # ----------------------------
