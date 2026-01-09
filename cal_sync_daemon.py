@@ -19,6 +19,35 @@ from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import InstalledAppFlow
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def _load_env_file(path: str) -> None:
+    if not path or not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for raw in handle:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("export "):
+                    line = line[len("export "):].strip()
+                if "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                if not key:
+                    continue
+                if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
+                    value = value[1:-1]
+                os.environ.setdefault(key, value)
+    except Exception as e:
+        print(f"[config] failed to read env file '{path}': {e}")
+
+ENV_FILE_PATH = os.environ.get("SYNC_ENV_PATH", os.path.join(SCRIPT_DIR, "sync.env"))
+_load_env_file(ENV_FILE_PATH)
+
 # ----------------------------
 # Config
 # ----------------------------
@@ -34,7 +63,6 @@ DB_PATH = os.environ.get("SYNC_DB_PATH", "sync_state.sqlite3")
 
 LOCAL_TZ = tz.tzlocal()
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CREDS_PATH = os.path.join(SCRIPT_DIR, "credentials.json")
 TOKEN_PATH = os.path.join(SCRIPT_DIR, "token.json")
 
