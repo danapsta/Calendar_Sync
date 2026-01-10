@@ -963,6 +963,7 @@ def sync_once() -> Tuple[bool, Optional[str]]:
 
     google_token_safe_to_advance = True
     next_sync_token: Optional[str] = None
+    outlook_updated_from_google: Set[str] = set()
 
     try:
         # --- Outlook changes
@@ -1044,6 +1045,8 @@ def sync_once() -> Tuple[bool, Optional[str]]:
                     except Exception:
                         updated_mod = None
                     map_upsert(new_outlook_id, grec.uid, updated_mod, grec.last_modified)
+                    if new_outlook_id:
+                        outlook_updated_from_google.add(new_outlook_id)
 
                 else:
                     print(f"[sync] Google new -> Outlook create: {grec.uid}")
@@ -1055,6 +1058,8 @@ def sync_once() -> Tuple[bool, Optional[str]]:
                     except Exception:
                         created_mod = None
                     map_upsert(outlook_id_new, grec.uid, created_mod, grec.last_modified)
+                    if outlook_id_new:
+                        outlook_updated_from_google.add(outlook_id_new)
 
             except Exception as e:
                 print(f"[sync] Google->Outlook failed googleId={grec.uid} err={e}")
@@ -1084,6 +1089,8 @@ def sync_once() -> Tuple[bool, Optional[str]]:
         # --- Outlook -> Google
         for orec in outlook_changed:
             try:
+                if orec.uid in outlook_updated_from_google:
+                    continue
                 google_id = orec.gcal_event_id_hint
 
                 mapped = map_get_by_outlook(orec.uid)
