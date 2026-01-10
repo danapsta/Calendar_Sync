@@ -347,6 +347,27 @@ def dt_round_sec(d: dt.datetime) -> dt.datetime:
 def dt_equal_sec(a: dt.datetime, b: dt.datetime) -> bool:
     return dt_round_sec(a) == dt_round_sec(b)
 
+def parse_google_dt(dt_obj: Dict[str, Any]) -> dt.datetime:
+    """
+    Google event start/end object may contain:
+      - {"dateTime": "..."} with offset/Z
+      - {"dateTime": "...", "timeZone": "America/Chicago"} (dateTime may be naive)
+    Returns timezone-aware datetime in LOCAL_TZ.
+    """
+    raw = dt_obj.get("dateTime")
+    if not raw:
+        raise ValueError("no dateTime in object")
+    tz_name = (dt_obj.get("timeZone") or "").strip()
+
+    parsed = isoparse(raw)
+    if parsed.tzinfo is None:
+        tzinfo = _timezone_from_name(tz_name) if tz_name else None
+        if not tzinfo:
+            tzinfo = LOCAL_TZ
+        parsed = parsed.replace(tzinfo=tzinfo)
+
+    return parsed.astimezone(LOCAL_TZ)
+
 def parse_outlook_categories(raw: str) -> List[str]:
     # Outlook Categories is a comma-separated string in most setups
     if not raw:
@@ -543,8 +564,8 @@ def google_to_record(ev: Dict[str, Any]) -> EventRecord:
 
     all_day = False
     if "dateTime" in ev.get("start", {}):
-        start = isoparse(ev["start"]["dateTime"]).astimezone(LOCAL_TZ)
-        end = isoparse(ev["end"]["dateTime"]).astimezone(LOCAL_TZ)
+        start = parse_google_dt(ev["start"])
+        end = parse_google_dt(ev["end"])
     else:
         all_day = True
         start = isoparse(ev["start"]["date"]).replace(tzinfo=LOCAL_TZ)
