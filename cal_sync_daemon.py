@@ -12,6 +12,7 @@ import pythoncom
 import win32com.client  # pywin32
 from dateutil import tz
 from dateutil.parser import isoparse
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -56,11 +57,20 @@ SCOPES = ["https://www.googleapis.com/auth/calendar"]
 def _resolve_timezone() -> tz.tzfile:
     tz_name = os.environ.get("SYNC_TIMEZONE", "").strip()
     if tz_name:
-        tzinfo = tz.gettz(tz_name)
+        tzinfo = _timezone_from_name(tz_name)
         if tzinfo:
             return tzinfo
         print(f"[config] invalid SYNC_TIMEZONE '{tz_name}', falling back to local timezone")
     return tz.tzlocal()
+
+def _timezone_from_name(tz_name: str) -> Optional[dt.tzinfo]:
+    if not tz_name:
+        return None
+    try:
+        return ZoneInfo(tz_name)
+    except ZoneInfoNotFoundError:
+        pass
+    return tz.gettz(tz_name)
 
 POLL_SECONDS = int(os.environ.get("SYNC_POLL_SECONDS", "60"))
 LOOKBACK_DAYS = int(os.environ.get("SYNC_LOOKBACK_DAYS", "365"))
@@ -459,7 +469,7 @@ def google_service():
         print(f"[google] target calendarId='{GOOGLE_CALENDAR_ID}' resolves to summary='{cal2.get('summary')}' id='{cal2.get('id')}' tz='{cal2.get('timeZone')}'")
         if not _SYNC_TZ_EXPLICIT:
             tz_name = (cal2.get("timeZone") or "").strip()
-            tzinfo = tz.gettz(tz_name) if tz_name else None
+            tzinfo = _timezone_from_name(tz_name)
             if tzinfo:
                 LOCAL_TZ = tzinfo
             elif tz_name:
