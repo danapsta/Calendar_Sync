@@ -53,6 +53,15 @@ _load_env_file(ENV_FILE_PATH)
 # ----------------------------
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
+def _resolve_timezone() -> tz.tzfile:
+    tz_name = os.environ.get("SYNC_TIMEZONE", "").strip()
+    if tz_name:
+        tzinfo = tz.gettz(tz_name)
+        if tzinfo:
+            return tzinfo
+        print(f"[config] invalid SYNC_TIMEZONE '{tz_name}', falling back to local timezone")
+    return tz.tzlocal()
+
 POLL_SECONDS = int(os.environ.get("SYNC_POLL_SECONDS", "60"))
 LOOKBACK_DAYS = int(os.environ.get("SYNC_LOOKBACK_DAYS", "365"))
 LOOKAHEAD_DAYS = int(os.environ.get("SYNC_LOOKAHEAD_DAYS", "365"))
@@ -61,7 +70,7 @@ GOOGLE_CALENDAR_ID = os.environ.get("GOOGLE_CALENDAR_ID", "primary")
 
 DB_PATH = os.environ.get("SYNC_DB_PATH", "sync_state.sqlite3")
 
-LOCAL_TZ = tz.tzlocal()
+LOCAL_TZ = _resolve_timezone()
 
 CREDS_PATH = os.path.join(SCRIPT_DIR, "credentials.json")
 TOKEN_PATH = os.path.join(SCRIPT_DIR, "token.json")
