@@ -241,21 +241,43 @@ def map_upsert(outlook_id: str, google_id: str, outlook_mod: Optional[dt.datetim
     def _impl():
         con = _db_connect()
         cur = con.cursor()
-        cur.execute("""
-        INSERT INTO mapping(outlook_id, google_id, last_sync_outlook_mod, last_sync_google_mod)
-        VALUES(?,?,?,?)
-        ON CONFLICT(outlook_id) DO UPDATE SET
-          google_id=excluded.google_id,
-          last_sync_outlook_mod=excluded.last_sync_outlook_mod,
-          last_sync_google_mod=excluded.last_sync_google_mod
-        """, (
-            outlook_id,
-            google_id,
-            outlook_mod.isoformat() if outlook_mod else None,
-            google_mod.isoformat() if google_mod else None
-        ))
-        con.commit()
-        con.close()
+        try:
+            cur.execute("""
+            INSERT INTO mapping(outlook_id, google_id, last_sync_outlook_mod, last_sync_google_mod)
+            VALUES(?,?,?,?)
+            ON CONFLICT(outlook_id) DO UPDATE SET
+              google_id=excluded.google_id,
+              last_sync_outlook_mod=excluded.last_sync_outlook_mod,
+              last_sync_google_mod=excluded.last_sync_google_mod
+            """, (
+                outlook_id,
+                google_id,
+                outlook_mod.isoformat() if outlook_mod else None,
+                google_mod.isoformat() if google_mod else None
+            ))
+            con.commit()
+        except sqlite3.IntegrityError as e:
+            msg = str(e).lower()
+            if "unique constraint failed: mapping.google_id" in msg:
+                cur.execute("DELETE FROM mapping WHERE google_id=? AND outlook_id<>?", (google_id, outlook_id))
+                cur.execute("""
+                INSERT INTO mapping(outlook_id, google_id, last_sync_outlook_mod, last_sync_google_mod)
+                VALUES(?,?,?,?)
+                ON CONFLICT(outlook_id) DO UPDATE SET
+                  google_id=excluded.google_id,
+                  last_sync_outlook_mod=excluded.last_sync_outlook_mod,
+                  last_sync_google_mod=excluded.last_sync_google_mod
+                """, (
+                    outlook_id,
+                    google_id,
+                    outlook_mod.isoformat() if outlook_mod else None,
+                    google_mod.isoformat() if google_mod else None
+                ))
+                con.commit()
+            else:
+                raise
+        finally:
+            con.close()
     _db_retry(_impl)
 
 def map_delete_by_outlook(outlook_id: str):
