@@ -237,6 +237,14 @@ def map_get_by_google(google_id: str) -> Optional[Tuple[str, str, str]]:
         return row if row else None
     return _db_retry(_impl)
 
+def parse_sync_mod(raw: Optional[str]) -> Optional[dt.datetime]:
+    if not raw:
+        return None
+    try:
+        return isoparse(raw).astimezone(LOCAL_TZ)
+    except Exception:
+        return None
+
 def map_upsert(outlook_id: str, google_id: str, outlook_mod: Optional[dt.datetime], google_mod: Optional[dt.datetime]):
     def _impl():
         con = _db_connect()
@@ -989,12 +997,21 @@ def sync_once() -> Tuple[bool, Optional[str]]:
             try:
                 mapped = map_get_by_google(grec.uid)
                 outlook_id = None
+                last_outlook_mod = None
+                last_google_mod = None
 
                 if grec.outlook_entry_id_hint:
                     outlook_id = grec.outlook_entry_id_hint
 
-                if mapped and not outlook_id:
-                    outlook_id, _, _ = mapped
+                if mapped:
+                    outlook_id_from_map, last_outlook_mod_raw, last_google_mod_raw = mapped
+                    last_outlook_mod = parse_sync_mod(last_outlook_mod_raw)
+                    last_google_mod = parse_sync_mod(last_google_mod_raw)
+                    if not outlook_id:
+                        outlook_id = outlook_id_from_map
+
+                if last_google_mod and last_google_mod >= grec.last_modified:
+                    continue
 
                 if grec.deleted:
                     if outlook_id:
@@ -1020,12 +1037,24 @@ def sync_once() -> Tuple[bool, Optional[str]]:
                     print(f"[sync] Google update -> Outlook patch: {grec.uid} -> {outlook_id}")
                     new_outlook_id = outlook_create_or_update(ns, grec, outlook_id, google_id_to_stamp=grec.uid)
                     # protect against UNIQUE constraint by ensuring outlook_id is the actual saved EntryID
-                    map_upsert(new_outlook_id, grec.uid, None, grec.last_modified)
+                    updated_mod = None
+                    try:
+                        updated_item = ns.GetItemFromID(new_outlook_id)
+                        updated_mod = outlook_item_to_record(updated_item).last_modified
+                    except Exception:
+                        updated_mod = None
+                    map_upsert(new_outlook_id, grec.uid, updated_mod, grec.last_modified)
 
                 else:
                     print(f"[sync] Google new -> Outlook create: {grec.uid}")
                     outlook_id_new = outlook_create_or_update(ns, grec, None, google_id_to_stamp=grec.uid)
-                    map_upsert(outlook_id_new, grec.uid, None, grec.last_modified)
+                    created_mod = None
+                    try:
+                        created_item = ns.GetItemFromID(outlook_id_new)
+                        created_mod = outlook_item_to_record(created_item).last_modified
+                    except Exception:
+                        created_mod = None
+                    map_upsert(outlook_id_new, grec.uid, created_mod, grec.last_modified)
 
             except Exception as e:
                 print(f"[sync] Google->Outlook failed googleId={grec.uid} err={e}")
@@ -1058,8 +1087,17 @@ def sync_once() -> Tuple[bool, Optional[str]]:
                 google_id = orec.gcal_event_id_hint
 
                 mapped = map_get_by_outlook(orec.uid)
-                if mapped and not google_id:
-                    google_id, _, _ = mapped
+                last_outlook_mod = None
+                last_google_mod = None
+                if mapped:
+                    google_id_from_map, last_outlook_mod_raw, last_google_mod_raw = mapped
+                    last_outlook_mod = parse_sync_mod(last_outlook_mod_raw)
+                    last_google_mod = parse_sync_mod(last_google_mod_raw)
+                    if not google_id:
+                        google_id = google_id_from_map
+
+                if last_outlook_mod and last_outlook_mod >= orec.last_modified:
+                    continue
 
                 if not google_id:
                     try:
