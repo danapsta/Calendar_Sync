@@ -554,7 +554,12 @@ def google_to_record(ev: Dict[str, Any]) -> EventRecord:
         google_color_id=color_id,
     )
 
-def google_upsert_event(svc, rec: EventRecord, google_id: Optional[str] = None, outlook_entry_id: Optional[str] = None) -> str:
+def google_upsert_event(
+    svc,
+    rec: EventRecord,
+    google_id: Optional[str] = None,
+    outlook_entry_id: Optional[str] = None
+) -> Tuple[str, Optional[dt.datetime]]:
     # Determine google color from Outlook categories (if this record is coming from Outlook)
     # If rec already has google_color_id explicitly set, keep it.
     color_id = rec.google_color_id
@@ -595,12 +600,18 @@ def google_upsert_event(svc, rec: EventRecord, google_id: Optional[str] = None, 
         updated = svc.events().patch(calendarId=GOOGLE_CALENDAR_ID, eventId=google_id, body=body).execute()
         if GOOGLE_UPSERT_DEBUG:
             print(f"[google] PATCHED id={updated.get('id')} link={updated.get('htmlLink')}")
-        return updated["id"]
+        updated_time = None
+        if updated.get("updated"):
+            updated_time = isoparse(updated["updated"]).astimezone(LOCAL_TZ)
+        return updated["id"], updated_time
     else:
         created = svc.events().insert(calendarId=GOOGLE_CALENDAR_ID, body=body).execute()
         if GOOGLE_UPSERT_DEBUG:
             print(f"[google] CREATED id={created.get('id')} link={created.get('htmlLink')}")
-        return created["id"]
+        created_time = None
+        if created.get("updated"):
+            created_time = isoparse(created["updated"]).astimezone(LOCAL_TZ)
+        return created["id"], created_time
 
 def google_delete_event(svc, google_id: str):
     svc.events().delete(calendarId=GOOGLE_CALENDAR_ID, eventId=google_id).execute()
@@ -1133,7 +1144,12 @@ def sync_once() -> Tuple[bool, Optional[str]]:
                 if google_id:
                     print(f"[sync] Outlook update -> Google patch: {orec.uid} -> {google_id}")
                     try:
-                        new_gid = google_upsert_event(gsvc, orec, google_id=google_id, outlook_entry_id=orec.uid)
+                        new_gid, google_updated = google_upsert_event(
+                            gsvc,
+                            orec,
+                            google_id=google_id,
+                            outlook_entry_id=orec.uid
+                        )
                         # Stamp both ID and color into Outlook for persistence
                         updated_outlook_mod = orec.last_modified
                         try:
@@ -1146,7 +1162,12 @@ def sync_once() -> Tuple[bool, Optional[str]]:
                             updated_outlook_mod = outlook_item_to_record(it).last_modified
                         except Exception:
                             pass
-                        map_upsert(orec.uid, new_gid, updated_outlook_mod, dt.datetime.now(tz=LOCAL_TZ))
+                        map_upsert(
+                            orec.uid,
+                            new_gid,
+                            updated_outlook_mod,
+                            google_updated or dt.datetime.now(tz=LOCAL_TZ)
+                        )
                     except HttpError as e:
                         print(f"[sync] Outlook->Google patch failed EntryID={orec.uid} err={e}")
                         if is_event_type_restriction(e):
@@ -1158,7 +1179,12 @@ def sync_once() -> Tuple[bool, Optional[str]]:
                 else:
                     print(f"[sync] Outlook new -> Google create: {orec.uid}")
                     try:
-                        gid = google_upsert_event(gsvc, orec, google_id=None, outlook_entry_id=orec.uid)
+                        gid, google_updated = google_upsert_event(
+                            gsvc,
+                            orec,
+                            google_id=None,
+                            outlook_entry_id=orec.uid
+                        )
                         updated_outlook_mod = orec.last_modified
                         try:
                             it = ns.GetItemFromID(orec.uid)
@@ -1170,7 +1196,12 @@ def sync_once() -> Tuple[bool, Optional[str]]:
                             updated_outlook_mod = outlook_item_to_record(it).last_modified
                         except Exception:
                             pass
-                        map_upsert(orec.uid, gid, updated_outlook_mod, dt.datetime.now(tz=LOCAL_TZ))
+                        map_upsert(
+                            orec.uid,
+                            gid,
+                            updated_outlook_mod,
+                            google_updated or dt.datetime.now(tz=LOCAL_TZ)
+                        )
                     except HttpError as e:
                         print(f"[sync] Outlook->Google create failed EntryID={orec.uid} err={e}")
                         if is_event_type_restriction(e):
