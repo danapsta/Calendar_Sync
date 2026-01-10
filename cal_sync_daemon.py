@@ -466,6 +466,12 @@ def is_rate_limited(err: Exception) -> bool:
     s = str(err)
     return ("rateLimitExceeded" in s) or ("Rate Limit Exceeded" in s) or ("userRateLimitExceeded" in s)
 
+def is_event_type_restriction(err: Exception) -> bool:
+    if not isinstance(err, HttpError):
+        return False
+    s = str(err)
+    return "eventTypeRestriction" in s or "event type must not have private extended properties" in s
+
 def google_list_changes(svc) -> Tuple[List[Dict[str, Any]], Optional[str]]:
     sync_token = (kv_get("google_sync_token") or "").strip()
 
@@ -1129,6 +1135,7 @@ def sync_once() -> Tuple[bool, Optional[str]]:
                     try:
                         new_gid = google_upsert_event(gsvc, orec, google_id=google_id, outlook_entry_id=orec.uid)
                         # Stamp both ID and color into Outlook for persistence
+                        updated_outlook_mod = orec.last_modified
                         try:
                             it = ns.GetItemFromID(orec.uid)
                             outlook_set_userprop_str(it, OUTLOOK_PROP_GCAL_ID, new_gid)
@@ -1136,11 +1143,15 @@ def sync_once() -> Tuple[bool, Optional[str]]:
                             if color_to_stamp:
                                 outlook_set_userprop_str(it, OUTLOOK_PROP_GCAL_COLOR_ID, str(color_to_stamp))
                             it.Save()
+                            updated_outlook_mod = outlook_item_to_record(it).last_modified
                         except Exception:
                             pass
-                        map_upsert(orec.uid, new_gid, orec.last_modified, dt.datetime.now(tz=LOCAL_TZ))
+                        map_upsert(orec.uid, new_gid, updated_outlook_mod, dt.datetime.now(tz=LOCAL_TZ))
                     except HttpError as e:
                         print(f"[sync] Outlook->Google patch failed EntryID={orec.uid} err={e}")
+                        if is_event_type_restriction(e):
+                            map_upsert(orec.uid, google_id, orec.last_modified, dt.datetime.now(tz=LOCAL_TZ))
+                            continue
                         if is_rate_limited(e):
                             google_token_safe_to_advance = False
                             raise
@@ -1148,6 +1159,7 @@ def sync_once() -> Tuple[bool, Optional[str]]:
                     print(f"[sync] Outlook new -> Google create: {orec.uid}")
                     try:
                         gid = google_upsert_event(gsvc, orec, google_id=None, outlook_entry_id=orec.uid)
+                        updated_outlook_mod = orec.last_modified
                         try:
                             it = ns.GetItemFromID(orec.uid)
                             outlook_set_userprop_str(it, OUTLOOK_PROP_GCAL_ID, gid)
@@ -1155,11 +1167,14 @@ def sync_once() -> Tuple[bool, Optional[str]]:
                             if color_to_stamp:
                                 outlook_set_userprop_str(it, OUTLOOK_PROP_GCAL_COLOR_ID, str(color_to_stamp))
                             it.Save()
+                            updated_outlook_mod = outlook_item_to_record(it).last_modified
                         except Exception:
                             pass
-                        map_upsert(orec.uid, gid, orec.last_modified, dt.datetime.now(tz=LOCAL_TZ))
+                        map_upsert(orec.uid, gid, updated_outlook_mod, dt.datetime.now(tz=LOCAL_TZ))
                     except HttpError as e:
                         print(f"[sync] Outlook->Google create failed EntryID={orec.uid} err={e}")
+                        if is_event_type_restriction(e):
+                            continue
                         if is_rate_limited(e):
                             google_token_safe_to_advance = False
                             raise
