@@ -12,6 +12,7 @@ import pythoncom
 import win32com.client  # pywin32
 from dateutil import tz
 from dateutil.parser import isoparse
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -19,10 +20,57 @@ from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import InstalledAppFlow
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def _load_env_file(path: str) -> None:
+    if not path or not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for raw in handle:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("export "):
+                    line = line[len("export "):].strip()
+                if "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                if not key:
+                    continue
+                if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
+                    value = value[1:-1]
+                os.environ.setdefault(key, value)
+    except Exception as e:
+        print(f"[config] failed to read env file '{path}': {e}")
+
+ENV_FILE_PATH = os.environ.get("SYNC_ENV_PATH", os.path.join(SCRIPT_DIR, "sync.env"))
+_load_env_file(ENV_FILE_PATH)
+
 # ----------------------------
 # Config
 # ----------------------------
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
+
+def _resolve_timezone() -> tz.tzfile:
+    tz_name = os.environ.get("SYNC_TIMEZONE", "").strip()
+    if tz_name:
+        tzinfo = _timezone_from_name(tz_name)
+        if tzinfo:
+            return tzinfo
+        print(f"[config] invalid SYNC_TIMEZONE '{tz_name}', falling back to local timezone")
+    return tz.tzlocal()
+
+def _timezone_from_name(tz_name: str) -> Optional[dt.tzinfo]:
+    if not tz_name:
+        return None
+    try:
+        return ZoneInfo(tz_name)
+    except ZoneInfoNotFoundError:
+        pass
+    return tz.gettz(tz_name)
 
 POLL_SECONDS = int(os.environ.get("SYNC_POLL_SECONDS", "60"))
 LOOKBACK_DAYS = int(os.environ.get("SYNC_LOOKBACK_DAYS", "365"))
@@ -32,9 +80,9 @@ GOOGLE_CALENDAR_ID = os.environ.get("GOOGLE_CALENDAR_ID", "primary")
 
 DB_PATH = os.environ.get("SYNC_DB_PATH", "sync_state.sqlite3")
 
-LOCAL_TZ = tz.tzlocal()
+LOCAL_TZ = _resolve_timezone()
+_SYNC_TZ_EXPLICIT = bool(os.environ.get("SYNC_TIMEZONE", "").strip())
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CREDS_PATH = os.path.join(SCRIPT_DIR, "credentials.json")
 TOKEN_PATH = os.path.join(SCRIPT_DIR, "token.json")
 
@@ -200,25 +248,55 @@ def map_get_by_google(google_id: str) -> Optional[Tuple[str, str, str]]:
         return row if row else None
     return _db_retry(_impl)
 
+def parse_sync_mod(raw: Optional[str]) -> Optional[dt.datetime]:
+    if not raw:
+        return None
+    try:
+        return isoparse(raw).astimezone(LOCAL_TZ)
+    except Exception:
+        return None
+
 def map_upsert(outlook_id: str, google_id: str, outlook_mod: Optional[dt.datetime], google_mod: Optional[dt.datetime]):
     def _impl():
         con = _db_connect()
         cur = con.cursor()
-        cur.execute("""
-        INSERT INTO mapping(outlook_id, google_id, last_sync_outlook_mod, last_sync_google_mod)
-        VALUES(?,?,?,?)
-        ON CONFLICT(outlook_id) DO UPDATE SET
-          google_id=excluded.google_id,
-          last_sync_outlook_mod=excluded.last_sync_outlook_mod,
-          last_sync_google_mod=excluded.last_sync_google_mod
-        """, (
-            outlook_id,
-            google_id,
-            outlook_mod.isoformat() if outlook_mod else None,
-            google_mod.isoformat() if google_mod else None
-        ))
-        con.commit()
-        con.close()
+        try:
+            cur.execute("""
+            INSERT INTO mapping(outlook_id, google_id, last_sync_outlook_mod, last_sync_google_mod)
+            VALUES(?,?,?,?)
+            ON CONFLICT(outlook_id) DO UPDATE SET
+              google_id=excluded.google_id,
+              last_sync_outlook_mod=excluded.last_sync_outlook_mod,
+              last_sync_google_mod=excluded.last_sync_google_mod
+            """, (
+                outlook_id,
+                google_id,
+                outlook_mod.isoformat() if outlook_mod else None,
+                google_mod.isoformat() if google_mod else None
+            ))
+            con.commit()
+        except sqlite3.IntegrityError as e:
+            msg = str(e).lower()
+            if "unique constraint failed: mapping.google_id" in msg:
+                cur.execute("DELETE FROM mapping WHERE google_id=? AND outlook_id<>?", (google_id, outlook_id))
+                cur.execute("""
+                INSERT INTO mapping(outlook_id, google_id, last_sync_outlook_mod, last_sync_google_mod)
+                VALUES(?,?,?,?)
+                ON CONFLICT(outlook_id) DO UPDATE SET
+                  google_id=excluded.google_id,
+                  last_sync_outlook_mod=excluded.last_sync_outlook_mod,
+                  last_sync_google_mod=excluded.last_sync_google_mod
+                """, (
+                    outlook_id,
+                    google_id,
+                    outlook_mod.isoformat() if outlook_mod else None,
+                    google_mod.isoformat() if google_mod else None
+                ))
+                con.commit()
+            else:
+                raise
+        finally:
+            con.close()
     _db_retry(_impl)
 
 def map_delete_by_outlook(outlook_id: str):
@@ -359,6 +437,7 @@ def should_ignore(rec: EventRecord) -> bool:
 # Google helpers
 # ----------------------------
 def google_service():
+    global LOCAL_TZ
     creds = None
     if os.path.exists(TOKEN_PATH):
         creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
@@ -388,6 +467,13 @@ def google_service():
     try:
         cal2 = svc.calendars().get(calendarId=GOOGLE_CALENDAR_ID).execute()
         print(f"[google] target calendarId='{GOOGLE_CALENDAR_ID}' resolves to summary='{cal2.get('summary')}' id='{cal2.get('id')}' tz='{cal2.get('timeZone')}'")
+        if not _SYNC_TZ_EXPLICIT:
+            tz_name = (cal2.get("timeZone") or "").strip()
+            tzinfo = _timezone_from_name(tz_name)
+            if tzinfo:
+                LOCAL_TZ = tzinfo
+            elif tz_name:
+                print(f"[config] invalid calendar timeZone '{tz_name}', keeping local timezone")
     except Exception as e:
         print(f"[google] target calendar lookup failed: {e}")
 
@@ -398,6 +484,12 @@ def is_rate_limited(err: Exception) -> bool:
         return False
     s = str(err)
     return ("rateLimitExceeded" in s) or ("Rate Limit Exceeded" in s) or ("userRateLimitExceeded" in s)
+
+def is_event_type_restriction(err: Exception) -> bool:
+    if not isinstance(err, HttpError):
+        return False
+    s = str(err)
+    return "eventTypeRestriction" in s or "event type must not have private extended properties" in s
 
 def google_list_changes(svc) -> Tuple[List[Dict[str, Any]], Optional[str]]:
     sync_token = (kv_get("google_sync_token") or "").strip()
@@ -481,7 +573,12 @@ def google_to_record(ev: Dict[str, Any]) -> EventRecord:
         google_color_id=color_id,
     )
 
-def google_upsert_event(svc, rec: EventRecord, google_id: Optional[str] = None, outlook_entry_id: Optional[str] = None) -> str:
+def google_upsert_event(
+    svc,
+    rec: EventRecord,
+    google_id: Optional[str] = None,
+    outlook_entry_id: Optional[str] = None
+) -> Tuple[str, Optional[dt.datetime]]:
     # Determine google color from Outlook categories (if this record is coming from Outlook)
     # If rec already has google_color_id explicitly set, keep it.
     color_id = rec.google_color_id
@@ -522,12 +619,18 @@ def google_upsert_event(svc, rec: EventRecord, google_id: Optional[str] = None, 
         updated = svc.events().patch(calendarId=GOOGLE_CALENDAR_ID, eventId=google_id, body=body).execute()
         if GOOGLE_UPSERT_DEBUG:
             print(f"[google] PATCHED id={updated.get('id')} link={updated.get('htmlLink')}")
-        return updated["id"]
+        updated_time = None
+        if updated.get("updated"):
+            updated_time = isoparse(updated["updated"]).astimezone(LOCAL_TZ)
+        return updated["id"], updated_time
     else:
         created = svc.events().insert(calendarId=GOOGLE_CALENDAR_ID, body=body).execute()
         if GOOGLE_UPSERT_DEBUG:
             print(f"[google] CREATED id={created.get('id')} link={created.get('htmlLink')}")
-        return created["id"]
+        created_time = None
+        if created.get("updated"):
+            created_time = isoparse(created["updated"]).astimezone(LOCAL_TZ)
+        return created["id"], created_time
 
 def google_delete_event(svc, google_id: str):
     svc.events().delete(calendarId=GOOGLE_CALENDAR_ID, eventId=google_id).execute()
@@ -588,7 +691,6 @@ def google_find_match_fuzzy(svc, rec: EventRecord) -> Optional[str]:
 # Outlook helpers (COM)
 # ----------------------------
 def outlook_namespace():
-    pythoncom.CoInitialize()
     app = win32com.client.Dispatch("Outlook.Application")
     ns = app.GetNamespace("MAPI")
     return ns
@@ -617,6 +719,34 @@ def outlook_list_changed_items(ns, since: dt.datetime) -> List[Any]:
     except Exception:
         for it in restricted:
             out.append(it)
+    return out
+
+def outlook_list_deleted_items(ns, since: dt.datetime) -> List[Tuple[str, Optional[str]]]:
+    # 3 = olFolderDeletedItems
+    deleted_folder = ns.GetDefaultFolder(3)
+    items = deleted_folder.Items
+    items.IncludeRecurrences = True
+    items.Sort("[LastModificationTime]")
+
+    flt = f"[LastModificationTime] >= '{dt_to_outlook_filter(since)}'"
+    restricted = items.Restrict(flt)
+
+    out: List[Tuple[str, Optional[str]]] = []
+    try:
+        for i in range(1, restricted.Count + 1):
+            it = restricted.Item(i)
+            if outlook_item_is_appointment(it):
+                entry_id = getattr(it, "EntryID", None)
+                if entry_id:
+                    gcal_hint = outlook_get_userprop_str(it, OUTLOOK_PROP_GCAL_ID)
+                    out.append((entry_id, gcal_hint))
+    except Exception:
+        for it in restricted:
+            if outlook_item_is_appointment(it):
+                entry_id = getattr(it, "EntryID", None)
+                if entry_id:
+                    gcal_hint = outlook_get_userprop_str(it, OUTLOOK_PROP_GCAL_ID)
+                    out.append((entry_id, gcal_hint))
     return out
 
 def outlook_item_is_appointment(item) -> bool:
@@ -854,6 +984,7 @@ def google_dedupe_window(svc):
 def sync_once() -> Tuple[bool, Optional[str]]:
     db_init()
 
+    pythoncom.CoInitialize()
     ns = outlook_namespace()
     gsvc = google_service()
 
@@ -870,10 +1001,12 @@ def sync_once() -> Tuple[bool, Optional[str]]:
 
     google_token_safe_to_advance = True
     next_sync_token: Optional[str] = None
+    outlook_updated_from_google: Set[str] = set()
 
     try:
         # --- Outlook changes
         outlook_changed: List[EventRecord] = []
+        deleted_outlook_items: List[Tuple[str, Optional[str]]] = []
         try:
             for it in outlook_list_changed_items(ns, since):
                 try:
@@ -883,6 +1016,7 @@ def sync_once() -> Tuple[bool, Optional[str]]:
                             outlook_changed.append(rec)
                 except Exception as e:
                     print(f"[outlook] bad item EntryID={getattr(it,'EntryID',None)} Subject={getattr(it,'Subject',None)} err={e}")
+            deleted_outlook_items = outlook_list_deleted_items(ns, since)
         except Exception as e:
             print(f"[outlook] error reading changes: {e}")
 
@@ -902,12 +1036,21 @@ def sync_once() -> Tuple[bool, Optional[str]]:
             try:
                 mapped = map_get_by_google(grec.uid)
                 outlook_id = None
+                last_outlook_mod = None
+                last_google_mod = None
 
                 if grec.outlook_entry_id_hint:
                     outlook_id = grec.outlook_entry_id_hint
 
-                if mapped and not outlook_id:
-                    outlook_id, _, _ = mapped
+                if mapped:
+                    outlook_id_from_map, last_outlook_mod_raw, last_google_mod_raw = mapped
+                    last_outlook_mod = parse_sync_mod(last_outlook_mod_raw)
+                    last_google_mod = parse_sync_mod(last_google_mod_raw)
+                    if not outlook_id:
+                        outlook_id = outlook_id_from_map
+
+                if last_google_mod and last_google_mod >= grec.last_modified:
+                    continue
 
                 if grec.deleted:
                     if outlook_id:
@@ -933,24 +1076,75 @@ def sync_once() -> Tuple[bool, Optional[str]]:
                     print(f"[sync] Google update -> Outlook patch: {grec.uid} -> {outlook_id}")
                     new_outlook_id = outlook_create_or_update(ns, grec, outlook_id, google_id_to_stamp=grec.uid)
                     # protect against UNIQUE constraint by ensuring outlook_id is the actual saved EntryID
-                    map_upsert(new_outlook_id, grec.uid, None, grec.last_modified)
+                    updated_mod = None
+                    try:
+                        updated_item = ns.GetItemFromID(new_outlook_id)
+                        updated_mod = outlook_item_to_record(updated_item).last_modified
+                    except Exception:
+                        updated_mod = None
+                    map_upsert(new_outlook_id, grec.uid, updated_mod, grec.last_modified)
+                    if new_outlook_id:
+                        outlook_updated_from_google.add(new_outlook_id)
 
                 else:
                     print(f"[sync] Google new -> Outlook create: {grec.uid}")
                     outlook_id_new = outlook_create_or_update(ns, grec, None, google_id_to_stamp=grec.uid)
-                    map_upsert(outlook_id_new, grec.uid, None, grec.last_modified)
+                    created_mod = None
+                    try:
+                        created_item = ns.GetItemFromID(outlook_id_new)
+                        created_mod = outlook_item_to_record(created_item).last_modified
+                    except Exception:
+                        created_mod = None
+                    map_upsert(outlook_id_new, grec.uid, created_mod, grec.last_modified)
+                    if outlook_id_new:
+                        outlook_updated_from_google.add(outlook_id_new)
 
             except Exception as e:
                 print(f"[sync] Google->Outlook failed googleId={grec.uid} err={e}")
 
+        # --- Outlook deletions -> Google
+        if deleted_outlook_items:
+            for outlook_id, gcal_hint in deleted_outlook_items:
+                google_id = gcal_hint
+                if not google_id:
+                    mapped = map_get_by_outlook(outlook_id)
+                    if mapped:
+                        google_id, _, _ = mapped
+                if not google_id:
+                    continue
+                try:
+                    print(f"[sync] Outlook deleted -> Google delete: {outlook_id} -> {google_id}")
+                    google_delete_event(gsvc, google_id)
+                except HttpError as e:
+                    print(f"[sync] Outlook delete -> Google delete failed EntryID={outlook_id} err={e}")
+                    if is_rate_limited(e):
+                        google_token_safe_to_advance = False
+                        raise
+                except Exception as e:
+                    print(f"[sync] Outlook delete -> Google delete failed EntryID={outlook_id} err={e}")
+                else:
+                    map_delete_by_outlook(outlook_id)
+                    map_delete_by_google(google_id)
+
         # --- Outlook -> Google
         for orec in outlook_changed:
             try:
+                if orec.uid in outlook_updated_from_google:
+                    continue
                 google_id = orec.gcal_event_id_hint
 
                 mapped = map_get_by_outlook(orec.uid)
-                if mapped and not google_id:
-                    google_id, _, _ = mapped
+                last_outlook_mod = None
+                last_google_mod = None
+                if mapped:
+                    google_id_from_map, last_outlook_mod_raw, last_google_mod_raw = mapped
+                    last_outlook_mod = parse_sync_mod(last_outlook_mod_raw)
+                    last_google_mod = parse_sync_mod(last_google_mod_raw)
+                    if not google_id:
+                        google_id = google_id_from_map
+
+                if last_outlook_mod and last_outlook_mod >= orec.last_modified:
+                    continue
 
                 if not google_id:
                     try:
@@ -973,8 +1167,14 @@ def sync_once() -> Tuple[bool, Optional[str]]:
                 if google_id:
                     print(f"[sync] Outlook update -> Google patch: {orec.uid} -> {google_id}")
                     try:
-                        new_gid = google_upsert_event(gsvc, orec, google_id=google_id, outlook_entry_id=orec.uid)
+                        new_gid, google_updated = google_upsert_event(
+                            gsvc,
+                            orec,
+                            google_id=google_id,
+                            outlook_entry_id=orec.uid
+                        )
                         # Stamp both ID and color into Outlook for persistence
+                        updated_outlook_mod = orec.last_modified
                         try:
                             it = ns.GetItemFromID(orec.uid)
                             outlook_set_userprop_str(it, OUTLOOK_PROP_GCAL_ID, new_gid)
@@ -982,18 +1182,33 @@ def sync_once() -> Tuple[bool, Optional[str]]:
                             if color_to_stamp:
                                 outlook_set_userprop_str(it, OUTLOOK_PROP_GCAL_COLOR_ID, str(color_to_stamp))
                             it.Save()
+                            updated_outlook_mod = outlook_item_to_record(it).last_modified
                         except Exception:
                             pass
-                        map_upsert(orec.uid, new_gid, orec.last_modified, dt.datetime.now(tz=LOCAL_TZ))
+                        map_upsert(
+                            orec.uid,
+                            new_gid,
+                            updated_outlook_mod,
+                            google_updated or dt.datetime.now(tz=LOCAL_TZ)
+                        )
                     except HttpError as e:
                         print(f"[sync] Outlook->Google patch failed EntryID={orec.uid} err={e}")
+                        if is_event_type_restriction(e):
+                            map_upsert(orec.uid, google_id, orec.last_modified, dt.datetime.now(tz=LOCAL_TZ))
+                            continue
                         if is_rate_limited(e):
                             google_token_safe_to_advance = False
                             raise
                 else:
                     print(f"[sync] Outlook new -> Google create: {orec.uid}")
                     try:
-                        gid = google_upsert_event(gsvc, orec, google_id=None, outlook_entry_id=orec.uid)
+                        gid, google_updated = google_upsert_event(
+                            gsvc,
+                            orec,
+                            google_id=None,
+                            outlook_entry_id=orec.uid
+                        )
+                        updated_outlook_mod = orec.last_modified
                         try:
                             it = ns.GetItemFromID(orec.uid)
                             outlook_set_userprop_str(it, OUTLOOK_PROP_GCAL_ID, gid)
@@ -1001,11 +1216,19 @@ def sync_once() -> Tuple[bool, Optional[str]]:
                             if color_to_stamp:
                                 outlook_set_userprop_str(it, OUTLOOK_PROP_GCAL_COLOR_ID, str(color_to_stamp))
                             it.Save()
+                            updated_outlook_mod = outlook_item_to_record(it).last_modified
                         except Exception:
                             pass
-                        map_upsert(orec.uid, gid, orec.last_modified, dt.datetime.now(tz=LOCAL_TZ))
+                        map_upsert(
+                            orec.uid,
+                            gid,
+                            updated_outlook_mod,
+                            google_updated or dt.datetime.now(tz=LOCAL_TZ)
+                        )
                     except HttpError as e:
                         print(f"[sync] Outlook->Google create failed EntryID={orec.uid} err={e}")
+                        if is_event_type_restriction(e):
+                            continue
                         if is_rate_limited(e):
                             google_token_safe_to_advance = False
                             raise
@@ -1019,6 +1242,7 @@ def sync_once() -> Tuple[bool, Optional[str]]:
 
     finally:
         kv_set("outlook_last_poll", sync_start.isoformat())
+        pythoncom.CoUninitialize()
 
 
 # ----------------------------
