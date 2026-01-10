@@ -898,6 +898,13 @@ def outlook_create_or_update(ns, rec: EventRecord, outlook_entry_id: Optional[st
         if rec.google_color_id:
             outlook_set_userprop_str(apt, OUTLOOK_PROP_GCAL_COLOR_ID, rec.google_color_id)
 
+        print(
+            "[debug] writing Outlook: "
+            f"title={rec.title!r} "
+            f"start_local={rec.start.astimezone(LOCAL_TZ)} "
+            f"start_utc={rec.start.astimezone(timezone.utc)}"
+        )
+
         apt.Save()
         return apt.EntryID
 
