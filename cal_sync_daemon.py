@@ -71,6 +71,7 @@ GOOGLE_CALENDAR_ID = os.environ.get("GOOGLE_CALENDAR_ID", "primary")
 DB_PATH = os.environ.get("SYNC_DB_PATH", "sync_state.sqlite3")
 
 LOCAL_TZ = _resolve_timezone()
+_SYNC_TZ_EXPLICIT = bool(os.environ.get("SYNC_TIMEZONE", "").strip())
 
 CREDS_PATH = os.path.join(SCRIPT_DIR, "credentials.json")
 TOKEN_PATH = os.path.join(SCRIPT_DIR, "token.json")
@@ -426,6 +427,7 @@ def should_ignore(rec: EventRecord) -> bool:
 # Google helpers
 # ----------------------------
 def google_service():
+    global LOCAL_TZ
     creds = None
     if os.path.exists(TOKEN_PATH):
         creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
@@ -455,6 +457,13 @@ def google_service():
     try:
         cal2 = svc.calendars().get(calendarId=GOOGLE_CALENDAR_ID).execute()
         print(f"[google] target calendarId='{GOOGLE_CALENDAR_ID}' resolves to summary='{cal2.get('summary')}' id='{cal2.get('id')}' tz='{cal2.get('timeZone')}'")
+        if not _SYNC_TZ_EXPLICIT:
+            tz_name = (cal2.get("timeZone") or "").strip()
+            tzinfo = tz.gettz(tz_name) if tz_name else None
+            if tzinfo:
+                LOCAL_TZ = tzinfo
+            elif tz_name:
+                print(f"[config] invalid calendar timeZone '{tz_name}', keeping local timezone")
     except Exception as e:
         print(f"[google] target calendar lookup failed: {e}")
 
@@ -702,7 +711,7 @@ def outlook_list_changed_items(ns, since: dt.datetime) -> List[Any]:
             out.append(it)
     return out
 
-def outlook_list_deleted_entry_ids(ns, since: dt.datetime) -> Set[str]:
+def outlook_list_deleted_items(ns, since: dt.datetime) -> List[Tuple[str, Optional[str]]]:
     # 3 = olFolderDeletedItems
     deleted_folder = ns.GetDefaultFolder(3)
     items = deleted_folder.Items
@@ -712,20 +721,22 @@ def outlook_list_deleted_entry_ids(ns, since: dt.datetime) -> Set[str]:
     flt = f"[LastModificationTime] >= '{dt_to_outlook_filter(since)}'"
     restricted = items.Restrict(flt)
 
-    out: Set[str] = set()
+    out: List[Tuple[str, Optional[str]]] = []
     try:
         for i in range(1, restricted.Count + 1):
             it = restricted.Item(i)
             if outlook_item_is_appointment(it):
                 entry_id = getattr(it, "EntryID", None)
                 if entry_id:
-                    out.add(entry_id)
+                    gcal_hint = outlook_get_userprop_str(it, OUTLOOK_PROP_GCAL_ID)
+                    out.append((entry_id, gcal_hint))
     except Exception:
         for it in restricted:
             if outlook_item_is_appointment(it):
                 entry_id = getattr(it, "EntryID", None)
                 if entry_id:
-                    out.add(entry_id)
+                    gcal_hint = outlook_get_userprop_str(it, OUTLOOK_PROP_GCAL_ID)
+                    out.append((entry_id, gcal_hint))
     return out
 
 def outlook_item_is_appointment(item) -> bool:
@@ -985,7 +996,7 @@ def sync_once() -> Tuple[bool, Optional[str]]:
     try:
         # --- Outlook changes
         outlook_changed: List[EventRecord] = []
-        deleted_outlook_ids: Set[str] = set()
+        deleted_outlook_items: List[Tuple[str, Optional[str]]] = []
         try:
             for it in outlook_list_changed_items(ns, since):
                 try:
@@ -995,7 +1006,7 @@ def sync_once() -> Tuple[bool, Optional[str]]:
                             outlook_changed.append(rec)
                 except Exception as e:
                     print(f"[outlook] bad item EntryID={getattr(it,'EntryID',None)} Subject={getattr(it,'Subject',None)} err={e}")
-            deleted_outlook_ids = outlook_list_deleted_entry_ids(ns, since)
+            deleted_outlook_items = outlook_list_deleted_items(ns, since)
         except Exception as e:
             print(f"[outlook] error reading changes: {e}")
 
@@ -1082,12 +1093,13 @@ def sync_once() -> Tuple[bool, Optional[str]]:
                 print(f"[sync] Google->Outlook failed googleId={grec.uid} err={e}")
 
         # --- Outlook deletions -> Google
-        if deleted_outlook_ids:
-            for outlook_id in deleted_outlook_ids:
-                mapped = map_get_by_outlook(outlook_id)
-                if not mapped:
-                    continue
-                google_id, _, _ = mapped
+        if deleted_outlook_items:
+            for outlook_id, gcal_hint in deleted_outlook_items:
+                google_id = gcal_hint
+                if not google_id:
+                    mapped = map_get_by_outlook(outlook_id)
+                    if mapped:
+                        google_id, _, _ = mapped
                 if not google_id:
                     continue
                 try:
@@ -1102,6 +1114,7 @@ def sync_once() -> Tuple[bool, Optional[str]]:
                     print(f"[sync] Outlook delete -> Google delete failed EntryID={outlook_id} err={e}")
                 else:
                     map_delete_by_outlook(outlook_id)
+                    map_delete_by_google(google_id)
 
         # --- Outlook -> Google
         for orec in outlook_changed:
